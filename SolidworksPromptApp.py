@@ -4,22 +4,26 @@ SolidWorks AI Prompt Tool - GUI Version
 A floating button + text box that stays on top of SolidWorks.
 Click the button, type a description, shape appears!
 
-Supported 3D Shapes: cube, box, cylinder, hexagon, triangle prism, pentagon, octagon, ellipse/oval
+Supported 3D Shapes: sphere, cube, box, cylinder, hexagon, triangle prism, pentagon, octagon, ellipse/oval
 Supported 2D Shapes: circle, square, rectangle, triangle, hexagon, pentagon, ellipse, line, arc
 
 Requirements:
     pip install pywin32
 
 Usage:
-    python solidworks_ai_gui.py
+    python SolidworksPromptApp.py
 """
 
 import tkinter as tk
 from tkinter import filedialog, messagebox
 import win32com.client
+import pythoncom
 import os
 import re
 import math
+import time
+
+from SolidworksCreate import SolidWorksCreator
 
 
 # =============================================================================
@@ -44,11 +48,12 @@ def convert_to_meters(value, unit="mm"):
 # =============================================================================
 
 class ParsedShape:
-    def __init__(self, shape_type, params, units="mm", is_2d=False):
+    def __init__(self, shape_type, params, units="mm", is_2d=False, on_top_of=None):
         self.shape_type = shape_type
         self.params = params
         self.units = units
         self.is_2d = is_2d
+        self.on_top_of = on_top_of  # None, True (follow-up), or ParsedShape
 
 
 def detect_units(prompt):
@@ -95,10 +100,60 @@ def extract_all_numbers(prompt):
 def parse_prompt(prompt):
     prompt_lower = prompt.lower().strip()
     units = detect_units(prompt)
-    
+
+    # --- ON THE PLANE: "put a sphere on the plane", "cylinder on that plane" ---
+    on_plane_match = re.search(
+        r'(?:put\s+|place\s+|add\s+)?(?:a\s+|the\s+)?(.+?)\s+on\s+(?:the|that)\s+plane',
+        prompt_lower
+    )
+    if on_plane_match:
+        shape = parse_prompt(on_plane_match.group(1).strip())
+        if shape:
+            shape.on_top_of = 'plane'
+            return shape
+
+    # --- PLANE CREATION: "create a plane", "add a plane at 15mm" ---
+    plane_match = re.search(
+        r'(?:create|add|make|place|insert)?\s*(?:a\s+|the\s+)?(?:horizontal\s+)?plane'
+        r'(?:\s+at\s+(\d+\.?\d*)\s*(mm|cm|m|in|inch|inches|ft|feet|foot|")?)?',
+        prompt_lower
+    )
+    if plane_match:
+        height = None
+        if plane_match.group(1):
+            unit = plane_match.group(2) or units
+            height = convert_to_meters(float(plane_match.group(1)), unit)
+        return ParsedShape('plane', {'height': height}, units)
+
+    # --- STACKING: "sphere on top of a cube", "put cylinder above box" ---
+    on_top_match = re.search(
+        r'(?:put\s+|place\s+|add\s+|stack\s+)?(?:a\s+|the\s+)?'
+        r'(.+?)\s+(?:on\s*top\s*of|above|on)\s+(?:a\s+|the\s+)?(.+)',
+        prompt_lower
+    )
+    if on_top_match:
+        top_prompt = on_top_match.group(1).strip()
+        bottom_prompt = on_top_match.group(2).strip()
+        top_shape = parse_prompt(top_prompt)
+        bottom_shape = parse_prompt(bottom_prompt)
+        if top_shape and bottom_shape:
+            top_shape.on_top_of = bottom_shape
+            return top_shape
+
+    # --- STACKING FOLLOW-UP: "put a sphere on top" ---
+    on_top_simple = re.search(
+        r'(?:put|place|add|stack)\s+(?:a\s+|the\s+)?(.+?)\s+(?:on\s*top|above|on\s*it)\s*$',
+        prompt_lower
+    )
+    if on_top_simple:
+        shape = parse_prompt(on_top_simple.group(1).strip())
+        if shape:
+            shape.on_top_of = True
+            return shape
+
     # Check if 2D is requested
     is_2d = any(word in prompt_lower for word in ['2d', 'sketch', 'draw', 'flat'])
-    
+
     # --- CYLINDER (3D) ---
     if any(word in prompt_lower for word in ['cylinder', 'cylindrical', 'tube', 'pipe']):
         radius = extract_dimension(prompt, 'radius', 'r')
@@ -118,6 +173,21 @@ def parse_prompt(prompt):
         height = height or 0.02
         return ParsedShape('cylinder', {'radius': radius, 'height': height}, units)
     
+    # --- SPHERE (3D) ---
+    elif any(word in prompt_lower for word in ['sphere', 'ball', 'orb']):
+        radius = extract_dimension(prompt, 'radius', 'r')
+        diameter = extract_dimension(prompt, 'diameter', 'dia', 'd')
+
+        if diameter and not radius:
+            radius = diameter / 2
+
+        if not radius:
+            numbers = extract_all_numbers(prompt)
+            radius = numbers[0] if numbers else 0.01
+
+        radius = radius or 0.01
+        return ParsedShape('sphere', {'radius': radius}, units)
+
     # --- CUBE (3D) ---
     elif 'cube' in prompt_lower:
         size = extract_dimension(prompt, 'side', 'size', 'length')
@@ -402,15 +472,25 @@ class SolidWorksApp:
         self.swApp = None
         self.model = None
         self.template_path = None
-    
+        self._nothing = None
+        self.creator = None
+
     def connect(self):
         try:
             self.swApp = win32com.client.GetActiveObject("SldWorks.Application")
         except:
             self.swApp = win32com.client.Dispatch("SldWorks.Application")
-        
+
         self.swApp.Visible = True
+        self._nothing = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
         self._find_template()
+
+        # Set up the SolidWorksCreator for shapes that need it (e.g. sphere)
+        self.creator = SolidWorksCreator()
+        self.creator.swApp = self.swApp
+        self.creator.template_path = self.template_path
+        self.creator._nothing = self._nothing
+
         return True
     
     def _find_template(self):
@@ -423,6 +503,7 @@ class SolidWorksApp:
             pass
         
         common_paths = [
+            r"C:\ProgramData\SolidWorks\SOLIDWORKS 2025\templates\Part.prtdot",
             r"C:\ProgramData\SolidWorks\SOLIDWORKS 2024\templates\Part.prtdot",
             r"C:\ProgramData\SolidWorks\SOLIDWORKS 2023\templates\Part.prtdot",
             r"C:\ProgramData\SolidWorks\SOLIDWORKS 2022\templates\Part.prtdot",
@@ -687,104 +768,101 @@ def create_rectangle_2d(sw, width, length):
 # Process Prompt
 # =============================================================================
 
+def _dispatch_shape(sw, parsed):
+    """Create a single shape via sw.creator and return its display name."""
+    c = sw.creator
+    p = parsed.params
+    t = parsed.shape_type
+
+    if t == 'plane':
+        return c.create_plane(p.get('height'))
+    elif t == 'sphere':
+        return c.create_sphere(p['radius'])
+    elif t == 'cylinder':
+        return c.create_cylinder(p['radius'], p['height'])
+    elif t == 'cube':
+        return c.create_cube(p['size'])
+    elif t == 'box':
+        return c.create_box(p['width'], p['height'], p['depth'])
+    elif t == 'hexagon':
+        if parsed.is_2d:
+            return c.create_polygon_2d(p['radius'], 6, "Hexagon")
+        return c.create_polygon_3d(p['radius'], p['height'], 6, "Hexagon")
+    elif t == 'triangle':
+        if parsed.is_2d:
+            return c.create_triangle_2d(p['base'], p['tri_height'])
+        return c.create_triangle_3d(p['base'], p['tri_height'], p['depth'])
+    elif t == 'pentagon':
+        if parsed.is_2d:
+            return c.create_polygon_2d(p['radius'], 5, "Pentagon")
+        return c.create_polygon_3d(p['radius'], p['height'], 5, "Pentagon")
+    elif t == 'octagon':
+        if parsed.is_2d:
+            return c.create_polygon_2d(p['radius'], 8, "Octagon")
+        return c.create_polygon_3d(p['radius'], p['height'], 8, "Octagon")
+    elif t == 'ellipse':
+        if parsed.is_2d:
+            return c.create_ellipse_2d(p['major'], p['minor'])
+        return c.create_ellipse_3d(p['major'], p['minor'], p['height'])
+    elif t == 'slot':
+        return c.create_slot_3d(p['length'], p['width'], p['height'])
+    elif t == 'washer':
+        return c.create_washer(p['outer'], p['inner'], p['height'])
+    elif t == 'lshape':
+        return c.create_lshape(p['width'], p['length'], p['thickness'], p['depth'])
+    elif t == 'cross':
+        return c.create_cross(p['size'], p['thickness'], p['depth'])
+    elif t == 'star':
+        if parsed.is_2d:
+            return c.create_star_2d(p['outer'], p.get('inner'), p['points'])
+        return c.create_star_3d(p['outer'], p.get('inner'), p['points'], p['height'])
+    elif t == 'circle':
+        return c.create_circle_2d(p['radius'])
+    elif t == 'square':
+        return c.create_square_2d(p['size'])
+    elif t == 'rectangle':
+        return c.create_rectangle_2d(p['width'], p['length'])
+    else:
+        raise ValueError(f"Shape '{t}' not implemented")
+
+
 def process_prompt(sw, prompt):
     parsed = parse_prompt(prompt)
-    
+
     if not parsed:
-        return False, "Unknown shape. Try: cube, box, cylinder, hexagon, triangle, pentagon, octagon, ellipse, star, cross, slot, washer, L-shape, circle, square, rectangle"
-    
+        return False, "Unknown shape. Try: sphere, cube, box, cylinder, hexagon, triangle, pentagon, octagon, ellipse, star, cross, slot, washer, L-shape, circle, square, rectangle"
+
     try:
-        p = parsed.params
-        t = parsed.shape_type
-        
-        if t == 'cylinder':
-            name = create_cylinder(sw, p['radius'], p['height'])
-        elif t == 'cube':
-            name = create_cube(sw, p['size'])
-        elif t == 'box':
-            name = create_box(sw, p['width'], p['height'], p['depth'])
-        elif t == 'hexagon':
-            if parsed.is_2d:
-                model = sw.new_part()
-                model.SketchManager.InsertSketch(True)
-                draw_polygon(model.SketchManager, 0, 0, p['radius'], 6)
-                model.SketchManager.InsertSketch(True)
-                sw.zoom_to_fit()
-                name = f"Hexagon 2D (r={p['radius']*1000:.1f}mm)"
-            else:
-                name = create_polygon_3d(sw, p['radius'], p['height'], 6, "Hexagon")
-        elif t == 'triangle':
-            if parsed.is_2d:
-                model = sw.new_part()
-                skMgr = model.SketchManager
-                skMgr.InsertSketch(True)
-                hb = p['base'] / 2
-                skMgr.CreateLine(-hb, 0, 0, hb, 0, 0)
-                skMgr.CreateLine(hb, 0, 0, 0, p['tri_height'], 0)
-                skMgr.CreateLine(0, p['tri_height'], 0, -hb, 0, 0)
-                skMgr.InsertSketch(True)
-                sw.zoom_to_fit()
-                name = f"Triangle 2D (base={p['base']*1000:.1f}mm)"
-            else:
-                name = create_triangle_3d(sw, p['base'], p['tri_height'], p['depth'])
-        elif t == 'pentagon':
-            if parsed.is_2d:
-                model = sw.new_part()
-                model.SketchManager.InsertSketch(True)
-                draw_polygon(model.SketchManager, 0, 0, p['radius'], 5)
-                model.SketchManager.InsertSketch(True)
-                sw.zoom_to_fit()
-                name = f"Pentagon 2D (r={p['radius']*1000:.1f}mm)"
-            else:
-                name = create_polygon_3d(sw, p['radius'], p['height'], 5, "Pentagon")
-        elif t == 'octagon':
-            if parsed.is_2d:
-                model = sw.new_part()
-                model.SketchManager.InsertSketch(True)
-                draw_polygon(model.SketchManager, 0, 0, p['radius'], 8)
-                model.SketchManager.InsertSketch(True)
-                sw.zoom_to_fit()
-                name = f"Octagon 2D (r={p['radius']*1000:.1f}mm)"
-            else:
-                name = create_polygon_3d(sw, p['radius'], p['height'], 8, "Octagon")
-        elif t == 'ellipse':
-            if parsed.is_2d:
-                model = sw.new_part()
-                model.SketchManager.InsertSketch(True)
-                model.SketchManager.CreateEllipse(0, 0, 0, p['major']/2, 0, 0, 0, p['minor']/2, 0)
-                model.SketchManager.InsertSketch(True)
-                sw.zoom_to_fit()
-                name = f"Ellipse 2D ({p['major']*1000:.1f}x{p['minor']*1000:.1f}mm)"
-            else:
-                name = create_ellipse_3d(sw, p['major'], p['minor'], p['height'])
-        elif t == 'slot':
-            name = create_slot_3d(sw, p['length'], p['width'], p['height'])
-        elif t == 'washer':
-            name = create_washer(sw, p['outer'], p['inner'], p['height'])
-        elif t == 'lshape':
-            name = create_lshape(sw, p['width'], p['length'], p['thickness'], p['depth'])
-        elif t == 'cross':
-            name = create_cross(sw, p['size'], p['thickness'], p['depth'])
-        elif t == 'star':
-            if parsed.is_2d:
-                model = sw.new_part()
-                model.SketchManager.InsertSketch(True)
-                draw_star(model.SketchManager, 0, 0, p['outer'], p['inner'], p['points'])
-                model.SketchManager.InsertSketch(True)
-                sw.zoom_to_fit()
-                name = f"{p['points']}-Point Star 2D"
-            else:
-                name = create_star_3d(sw, p['outer'], p['inner'], p['points'], p['height'])
-        elif t == 'circle':
-            name = create_circle_2d(sw, p['radius'])
-        elif t == 'square':
-            name = create_square_2d(sw, p['size'])
-        elif t == 'rectangle':
-            name = create_rectangle_2d(sw, p['width'], p['length'])
-        else:
-            return False, f"Shape '{t}' not implemented"
-        
+        # --- Stacking: "sphere on top of a cube" (single prompt) ---
+        if isinstance(parsed.on_top_of, ParsedShape):
+            sw.creator.reset()
+            bottom_name = _dispatch_shape(sw, parsed.on_top_of)
+            sw.creator.begin_stack()
+            top_name = _dispatch_shape(sw, parsed)
+            return True, f"{top_name} on top of {bottom_name}"
+
+        # --- Stacking follow-up: "put a sphere on top" ---
+        if parsed.on_top_of is True:
+            sw.creator.begin_stack()
+            name = _dispatch_shape(sw, parsed)
+            return True, f"{name} (stacked)"
+
+        # --- On the plane: "sphere on the plane" ---
+        if parsed.on_top_of == 'plane':
+            sw.creator.set_height_to_plane()
+            name = _dispatch_shape(sw, parsed)
+            return True, f"{name} (on plane)"
+
+        # --- Plane creation: additive, don't reset ---
+        if parsed.shape_type == 'plane':
+            name = _dispatch_shape(sw, parsed)
+            return True, name
+
+        # --- Normal standalone shape ---
+        sw.creator.reset()
+        name = _dispatch_shape(sw, parsed)
         return True, name
+
     except Exception as e:
         return False, str(e)
 
@@ -878,7 +956,7 @@ class PromptDialog(tk.Toplevel):
         self.entry.pack(fill='x', ipady=8)
         self.entry.bind('<Return>', lambda e: self._submit())
         
-        tk.Label(main, text='3D: cube, box, cylinder, hexagon, triangle, pentagon, star, cross, slot, washer', font=('Segoe UI', 8), fg='#888', bg='#2D2D2D').pack(anchor='w', pady=(5,0))
+        tk.Label(main, text='3D: sphere, cube, box, cylinder, hexagon, triangle, pentagon, star, cross, slot, washer', font=('Segoe UI', 8), fg='#888', bg='#2D2D2D').pack(anchor='w', pady=(5,0))
         tk.Label(main, text='2D: circle, square, rectangle  •  Add "2d" for sketch only', font=('Segoe UI', 8), fg='#888', bg='#2D2D2D').pack(anchor='w', pady=(0,8))
         
         btn_frame = tk.Frame(main, bg='#2D2D2D')
@@ -938,7 +1016,7 @@ class SolidWorksAIApp:
         print("=" * 50)
         print("  SolidWorks AI Prompt Tool")
         print("=" * 50)
-        print("\n3D: cube, box, cylinder, hexagon, triangle,")
+        print("\n3D: sphere, cube, box, cylinder, hexagon, triangle,")
         print("    pentagon, octagon, ellipse, star, cross,")
         print("    slot, washer, L-shape")
         print("\n2D: circle, square, rectangle")
